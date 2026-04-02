@@ -10,14 +10,14 @@ from PIL import Image
 from PIL.ExifTags import TAGS
 from io import BytesIO
 import piexif  # 引入专业的 EXIF 库
-from config import target_qq, cookies, cookies_str
+from config import target_qq, cookies, cookies_str, save_path, white_id_list, black_id_list
 
 import traceback
 import logging
 # logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(filename)s[%(lineno)d] %(levelname)s: %(message)s')
 
 import coloredlogs
-coloredlogs.install(level='ERROR',
+coloredlogs.install(level='INFO',
         fmt='%(asctime)s %(filename)s[%(lineno)d] %(levelname)s: %(message)s',
         milliseconds=True)
 
@@ -26,7 +26,7 @@ HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Referer': 'https://user.qzone.qq.com/',
 }
-
+format_type = "json"    #json/jsonp, json为纯数据，jsonp带回调函数
 # 解析cookie字符串为字典
 def parse_cookie_string(cookie_str):
     """将 'key1=value1; key2=value2' 格式的字符串解析为字典"""
@@ -38,7 +38,7 @@ def parse_cookie_string(cookie_str):
         if '=' in item:
             key, value = item.split('=', 1)
             cookies[key.strip()] = value.strip()
-    logging.info(f"解析cookie字符串成功: {cookies}")
+    logging.debug(f"解析cookie字符串成功: {cookies}")
     return cookies
 
 # 获取最终的cookies字典
@@ -110,7 +110,7 @@ def get_all_albums(uin, cookies):
         url = (
             f"https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/fcgi-bin/fcg_list_album_v3"
             f"?g_tk={g_tk}&t={int(time.time())}&hostUin={uin}&uin={uin}&appid=4"
-            f"&inCharset=utf-8&outCharset=utf-8&source=qzone&plat=qzone&format=jsonp"
+            f"&inCharset=utf-8&outCharset=utf-8&source=qzone&plat=qzone&format={format_type}"
             f"&notice=0&filter=1&handset=4&pageNumModeSort=40&pageNumModeClass={page}"
             f"&needUserInfo=1&idcNum=4&callbackFun=shine0"
         )
@@ -119,7 +119,7 @@ def get_all_albums(uin, cookies):
             break
         data = parse_jsonp(resp.text)
         if data.get('code') != 0:
-            logging.warning(f"获取相册失败: {data.get('message')}")
+            logging.error(f"获取相册失败: {data.get('message')}")
             break
 
         album_data = data.get('data', {})
@@ -150,7 +150,7 @@ def get_photos_in_album(album_id, uin, cookies):
             f"&topicId={album_id}&noTopic=0&uin={uin}&pageStart={start}&pageNum={page_size}"
             f"&skipCmtCount=0&singleurl=1&batchId=&notice=0&appid=4"
             f"&inCharset=utf-8&outCharset=utf-8&source=qzone&plat=qzone"
-            f"&outstyle=json&format=jsonp&json_esc=1&question=&answer=&callbackFun=shine0"
+            f"&outstyle=json&format={format_type}&json_esc=1&question=&answer=&callbackFun=shine0"
         )
         resp = requests.get(url, headers=HEADERS, cookies=cookies)
         if resp.status_code != 200:
@@ -180,7 +180,7 @@ def get_photo_comments(album_id, lloc, uin, cookies):
     url = (
         f"https://user.qzone.qq.com/proxy/domain/app.photo.qzone.qq.com/cgi-bin/app/cgi_pcomment_xml_v2"
         f"?uin={uin}&hostUin={uin}&start=0&num=50&order=1&topicId={topic_id}"
-        f"&format=jsonp&inCharset=utf-8&outCharset=utf-8&ref=photo"
+        f"&format={format_type}&inCharset=utf-8&outCharset=utf-8&ref=photo"
         f"&need_private_comment=1&albumId={album_id}&qzone=qzone&plat=qzone"
         f"&random={time.time()}&g_tk={g_tk}"
     )
@@ -451,8 +451,8 @@ def main():
 
     for album in albums:
         album_id = album.get('id')
-        # if album_id != "id":
-        #     continue
+        if (album_id in black_id_list) or (white_id_list and album_id not in white_id_list):
+            continue
         album_name = album.get('name', '未命名')
         folder_name = re.sub(r'[\\/*?:"<>|]', '_', album_name)
         folder_path = os.path.join(os.getcwd(), folder_name)
@@ -469,6 +469,26 @@ def main():
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+def get_photos_id():
+    '''获取相册ID和相册名称'''
+    try:
+        cookies = get_cookies_dict()
+    except ValueError as e:
+        logging.error(e)
+        return
+
+    logging.info("正在获取所有相册...")
+    albums = get_all_albums(target_qq, cookies)
+    logging.info(f"共找到 {len(albums)} 个相册")
+    photos_id = {}
+    for album in albums:
+        album_id = album.get('id')
+        album_name = album.get('name', '未命名')
+        #logging.info(f"处理相册: {album_name} (ID: {album_id})")
+        photos_id[album_id] = album_name
+    logging.info(json.dumps(photos_id, indent=4, ensure_ascii=False))
+    return photos_id
+    
 def main_th():
     '''
     照片多线程
@@ -485,8 +505,8 @@ def main_th():
 
     for album in albums:
         album_id = album.get('id')
-        # if (album_id != "idxxx"):
-        #     continue
+        if (album_id in black_id_list) or (white_id_list and album_id not in white_id_list):
+            continue
         album_name = album.get('name', '未命名')
         folder_name = re.sub(r'[\\/*?:"<>|]', '_', album_name)
         folder_path = os.path.join(os.getcwd(), folder_name)
@@ -546,9 +566,8 @@ def main_photo_thread():
         futures = []
         for album in albums:
             album_id = album.get('id')
-            # # 跳过某个相册
-            # if album_id == "xxxxx":
-            #     continue
+            if (album_id in black_id_list) or (white_id_list and album_id not in white_id_list):
+                continue
             album_name = album.get('name', '未命名')
             folder_name = re.sub(r'[\\/*?:"<>|]', '_', album_name)
             folder_path = os.path.join(os.getcwd(), folder_name)
@@ -566,5 +585,7 @@ def main_photo_thread():
 
 
 if __name__ == '__main__':
+    get_photos_id()
+    time.sleep(10)
     main_photo_thread()
     # main_th()

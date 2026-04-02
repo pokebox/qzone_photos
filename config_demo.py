@@ -16,4 +16,10 @@ cookies_str = (
 
 # 如果你使用方式1，请将上面 cookies_str 注释或删除，并将下面的 cookies 变量赋值为你的字典
 cookies = None          # 如果使用字典，这里改为你的字典，并注释掉 cookies_str 的赋值
+
+save_path = "./相册"
+# 白名单相册, 白名单中的相册将会被下载
+white_id_list = []
+# 黑名单相册, 黑名单中的相册将不会被下载
+black_id_list = []
 # =================================

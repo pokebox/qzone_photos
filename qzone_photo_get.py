@@ -104,11 +104,18 @@ def parse_jsonp(text):
     """
     # 去除首尾空白
     text = text.strip()
-    
+    # with open('debug_response.json', 'w', encoding='utf-8') as f:
+    #     f.write(text)
     # 尝试直接解析为 JSON
     try:
-        return json.loads(text)
+        return json.loads(text, strict=False)
     except json.JSONDecodeError:
+        try:
+            from json_repair import repair_json
+            rep_json = repair_json(text)
+            return json.loads(rep_json, strict=False)
+        except ImportError:
+            pass
         pass
 
     # 匹配 JSONP 回调：函数名(...)
@@ -122,15 +129,19 @@ def parse_jsonp(text):
         if json_str.endswith(';'):
             json_str = json_str[:-1]
         try:
-            return json.loads(json_str)
+            return json.loads(json_str, strict=False)
         except json.JSONDecodeError as e:
-            # 如果还是失败，打印调试信息
-            logging.error(f"JSON 解析失败: {e}")
-            logging.debug(f"尝试解析的内容前200字符: {json_str[:200]}")
+            try:
+                from json_repair import repair_json
+                rep_json = repair_json(json_str)
+                return json.loads(rep_json, strict=False)
+            except Exception as ee:
+                logging.error(f"JSON 解析失败: {e}\n{ee}")
+                logging.debug(f"尝试解析的内容前200字符: {json_str[:200]}")
             raise
 
     # 如果都失败，抛出异常
-    raise ValueError(f"无法解析 JSONP 响应: {text[:200]}...")
+    raise ValueError(f"无法解析 JSONP 响应: {text}")
 
 # 获取所有相册
 def get_all_albums(uin, cookies):
@@ -191,6 +202,8 @@ def get_photos_in_album(album_id, uin, cookies):
 
         photo_list = data.get('data', {}).get('photoList', [])
         # # 为每张照片添加 album_id
+        if not photo_list:
+            break
         for p in photo_list:
             p['album_id'] = album_id
         photos.extend(photo_list)
@@ -213,21 +226,38 @@ def get_photo_comments(album_id, lloc, uin, cookies):
         f"&need_private_comment=1&albumId={album_id}&qzone=qzone&plat=qzone"
         f"&random={time.time()}&g_tk={g_tk}"
     )
-    resp = session.get(url, cookies=cookies)
-    if resp.status_code != 200:
-        return []
-    data = parse_jsonp(resp.text)
-    if data.get('code') != 0:
-        return []
-    comments = data.get('data', {}).get('comments', [])
-    comment_lines = []
-    for cmt in comments:
-        poster = cmt.get('poster', {})
-        name = poster.get('name', '未知')
-        content = cmt.get('content', '')
-        if content.strip():
-            comment_lines.append(f"{name}: {content}")
-    return comment_lines
+    max_retries=3
+    retry_delay=1
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = session.get(url, timeout=30)
+            if resp.status_code == 200:
+                data = parse_jsonp(resp.text)
+                if data.get('code') != 0:
+                    return []
+                comments = data.get('data', {}).get('comments', [])
+                comment_lines = []
+                for cmt in comments:
+                    poster = cmt.get('poster', {})
+                    name = poster.get('name', '未知')
+                    content = cmt.get('content', '')
+                    if content.strip():
+                        comment_lines.append(f"[{name}]: {content}\r\n")
+                return comment_lines
+            elif resp.status_code == 404:
+                logging.warning(f"无法获取EXIF，状态码 404")
+                return {}
+            else:
+                logging.warning(f"获取EXIF失败 (尝试 {attempt}/{max_retries})，状态码 {resp.status_code}")
+        except Exception as e:
+            logging.error(f"获取EXIF异常 (尝试 {attempt}/{max_retries}): {e}")
+        if attempt < max_retries:
+            time.sleep(retry_delay)
+            retry_delay *= 2   # 指数退避
+    logging.error(f"获取照片原始 EXIF 失败: {album_id} {lloc}")
+    return []
+
+    
 
 # --- 辅助函数 - 将 '1/22' 这类字符串解析为 piexif 需要的 (分子, 分母) 元组 ---
 def parse_rational(val_str):
@@ -243,15 +273,14 @@ def parse_rational(val_str):
 
 def replace_trailing_b(url):
     """
-    将 URL 中最后一个 '/b' 及其之后的内容替换为 '/r'
+    将 URL 中最后一个 '/b' 或 '/o' 及其之后的内容替换为 '/r'
     """
     # 模式说明：
     # (.*)      - 贪婪匹配从开头到最后一个 '/b' 之前的所有内容（作为捕获组）
     # /b        - 匹配字面量 "/b"
     # .*$       - 匹配剩余部分直到字符串结尾
     # 替换为 \1/r，即保留捕获组内容，再拼接 "/r"
-    turl = re.sub(r'(.*)/b.*$', r'\1/r', url)
-    new_url = re.sub(r'(.*)/o.*$', r'\1/r', turl)
+    new_url = re.sub(r'/(o|b)[^/]*$', r'/r', url)
     return new_url
 
 # --- 调用接口获取照片原始 EXIF ---
@@ -264,15 +293,26 @@ def get_photo_exif(album_id, lloc, uin, cookies):
         f"&hostUin={uin}&plat=qzone&source=qzone&topicId={album_id}&lloc={lloc}"
         f"&refer=qzone&uin={uin}&callbackFun=shine1"
     )
-    resp = session.get(url, cookies=cookies)
-    if resp.status_code != 200:
-        return {}
-    try:
-        data = parse_jsonp(resp.text)
-        if data.get('code') == 0:
-            return data.get('data', {}).get('exif', {})
-    except Exception as e:
-        logging.error(f"  - 获取/解析原始 EXIF 失败: {e}")
+    max_retries=3
+    retry_delay=1
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = session.get(url, timeout=30)
+            if resp.status_code == 200:
+                data = parse_jsonp(resp.text)
+                if data.get('code') == 0:
+                    return data.get('data', {}).get('exif', {})
+            elif resp.status_code == 404:
+                logging.warning(f"无法获取EXIF，状态码 404")
+                return {}
+            else:
+                logging.warning(f"获取EXIF失败 (尝试 {attempt}/{max_retries})，状态码 {resp.status_code}")
+        except Exception as e:
+            logging.error(f"获取EXIF异常 (尝试 {attempt}/{max_retries}): {e}")
+        if attempt < max_retries:
+            time.sleep(retry_delay)
+            retry_delay *= 2   # 指数退避
+    logging.error(f"获取照片原始 EXIF 失败: {album_id} {lloc}")
     return {}
 
 def download_image_with_retry(img_url, max_retries=3, retry_delay=1):
@@ -299,18 +339,22 @@ def download_image_with_retry(img_url, max_retries=3, retry_delay=1):
     return None
 
 # --- 更新后的下载与保存逻辑 ---
-def download_and_save(photo, album_name, folder_path, uin, cookies):
+def download_and_save(photo, album_name, folder_path, uin, cookies, count=(0,0)):
     origin_url = photo.get('origin_url', '')
     raw_url = photo.get('raw', '')
+    _tmp_url = ''
     if photo.get('raw_upload') == 1 and raw_url:
         img_url = raw_url
-        logging.info("使用RAW")
+        _tmp_url = raw_url
+        logging.debug("使用RAW")
     elif photo.get('origin_upload') == 1 and origin_url:
+        _tmp_url = origin_url
         img_url = replace_trailing_b(origin_url)
-        logging.info(f"使用origin: {img_url}")
+        logging.debug(f"使用origin: {img_url}")
     else:
+        _tmp_url = photo.get('url', '')
         img_url = replace_trailing_b(photo.get('url', ''))
-        logging.info(f"使用url: {img_url}")
+        logging.debug(f"使用url: {img_url}")
         if not img_url:
             logging.warning(f"  - 无法获取图片URL，跳过")
             return
@@ -356,6 +400,7 @@ def download_and_save(photo, album_name, folder_path, uin, cookies):
     # 下载图片数据（使用新的重试函数）
     img_data = download_image_with_retry(img_url)
     if img_data is None:
+        logging.warning(f"  - {img_url}下载图片失败，跳过{_tmp_url}")
         return
 
     os.makedirs(folder_path, exist_ok=True)
@@ -470,7 +515,10 @@ def download_and_save(photo, album_name, folder_path, uin, cookies):
 
     # 第一次尝试正常保存
     if try_save_image(img_data, use_truncated=False):
-        logging.info(f"  已保存: {file_path}")
+        if count[1] != 0:
+            logging.info(f" {count[0]}/{count[1]} 张 已保存: {file_path}")
+        else:
+            logging.info(f" 已保存: {file_path}")
     else:
         # 重试下载（最多2次）
         saved = False
@@ -565,7 +613,7 @@ def main():
 
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
-def main_th():
+def get_img_thread():
     '''
     照片多线程
     '''
@@ -601,16 +649,18 @@ def main_th():
         photos = get_photos_in_album(album_id, target_qq, cookies)
         total = len(photos)
         logging.info(f"  相册内有 {total} 张照片")
+        if total == 0:
+            continue
 
         # 使用线程池并发下载（最多20个线程）
         with ThreadPoolExecutor(max_workers=20) as executor:
             # 提交所有下载任务
             futures = []
             for idx, photo in enumerate(photos, 1):
-                logging.info(f"    提交下载第 {idx}/{total} 张...")
+                logging.debug(f"    提交下载第 {idx}/{total} 张...")
                 future = executor.submit(
                     download_and_save,
-                    photo, album_name, folder_path, target_qq, cookies
+                    photo, album_name, folder_path, target_qq, cookies, (idx, total)
                 )
                 futures.append(future)
 
@@ -646,7 +696,7 @@ def main_th():
         time.sleep(1)   # 相册之间稍作延迟，避免请求过快
 
 
-def main_photo_thread():
+def get_photos_thread():
     '''
     相册多线程，最多同时处理20个相册
     '''
@@ -708,8 +758,4 @@ def main_photo_thread():
 
 
 if __name__ == '__main__':
-
-    # get_photos_id()
-    # time.sleep(10)
-    # main_photo_thread()
-    main_th()
+    get_img_thread()

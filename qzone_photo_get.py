@@ -6,15 +6,17 @@ import re
 import json
 import time
 import requests
-from PIL import Image
+from requests.adapters import HTTPAdapter
+from PIL import Image, ImageFile
 from PIL.ExifTags import TAGS
 from io import BytesIO
 import piexif  # 引入专业的 EXIF 库
+import threading
+import signal
 from config import target_qq, cookies, cookies_str, save_path, white_id_list, black_id_list
 
 import traceback
 import logging
-# logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(filename)s[%(lineno)d] %(levelname)s: %(message)s')
 
 import coloredlogs
 coloredlogs.install(level='INFO',
@@ -27,6 +29,35 @@ HEADERS = {
     'Referer': 'https://user.qzone.qq.com/',
 }
 format_type = "json"    #json/jsonp, json为纯数据，jsonp带回调函数
+
+shutdown_event = threading.Event()
+
+# ---------- 全局 Session 和 锁 ----------
+session = requests.Session()
+session.headers.update(HEADERS)
+_truncated_lock = threading.Lock()
+
+def init_session(cookies_dict):
+    session.cookies.update(cookies_dict)
+    # 增加连接池大小，适配多线程并发
+    adapter = HTTPAdapter(
+        pool_connections=30,   # 连接池中保存的连接数（不同主机）
+        pool_maxsize=30,       # 每个主机的最大连接数（与线程数匹配）
+        pool_block=True        # 池满时阻塞等待，而非丢弃连接
+    )
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+
+def signal_handler(signum, frame):
+    """收到中断信号时的处理函数：设置事件标志"""
+    logging.warning("收到中断信号 (Ctrl+C)，正在优雅停止...")
+    shutdown_event.set()  # 设置全局事件，通知所有线程停止
+
+def register_signal_handler():
+    """在主线程中注册信号处理器"""
+    signal.signal(signal.SIGINT, signal_handler) # 监听 Ctrl+C
+    signal.signal(signal.SIGTERM, signal_handler) # 监听终止信号
+
 # 解析cookie字符串为字典
 def parse_cookie_string(cookie_str):
     """将 'key1=value1; key2=value2' 格式的字符串解析为字典"""
@@ -107,14 +138,12 @@ def get_all_albums(uin, cookies):
     g_tk = get_g_tk(cookies)
     page = 15
     while True:
-        url = (
-            f"https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/fcgi-bin/fcg_list_album_v3"
-            f"?g_tk={g_tk}&t={int(time.time())}&hostUin={uin}&uin={uin}&appid=4"
-            f"&inCharset=utf-8&outCharset=utf-8&source=qzone&plat=qzone&format={format_type}"
-            f"&notice=0&filter=1&handset=4&pageNumModeSort=40&pageNumModeClass={page}"
-            f"&needUserInfo=1&idcNum=4&callbackFun=shine0"
-        )
-        resp = requests.get(url, headers=HEADERS, cookies=cookies)
+        url = (f"https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/fcgi-bin/fcg_list_album_v3"
+               f"?g_tk={g_tk}&t={int(time.time())}&hostUin={uin}&uin={uin}&appid=4"
+               f"&inCharset=utf-8&outCharset=utf-8&source=qzone&plat=qzone&format={format_type}"
+               f"&notice=0&filter=1&handset=4&pageNumModeSort=40&pageNumModeClass={page}"
+               f"&needUserInfo=1&idcNum=4&callbackFun=shine0")
+        resp = session.get(url, cookies=cookies)   # 共用 session发起请求
         if resp.status_code != 200:
             break
         data = parse_jsonp(resp.text)
@@ -152,7 +181,7 @@ def get_photos_in_album(album_id, uin, cookies):
             f"&inCharset=utf-8&outCharset=utf-8&source=qzone&plat=qzone"
             f"&outstyle=json&format={format_type}&json_esc=1&question=&answer=&callbackFun=shine0"
         )
-        resp = requests.get(url, headers=HEADERS, cookies=cookies)
+        resp = session.get(url, cookies=cookies)
         if resp.status_code != 200:
             break
         data = parse_jsonp(resp.text)
@@ -184,7 +213,7 @@ def get_photo_comments(album_id, lloc, uin, cookies):
         f"&need_private_comment=1&albumId={album_id}&qzone=qzone&plat=qzone"
         f"&random={time.time()}&g_tk={g_tk}"
     )
-    resp = requests.get(url, headers=HEADERS, cookies=cookies)
+    resp = session.get(url, cookies=cookies)
     if resp.status_code != 200:
         return []
     data = parse_jsonp(resp.text)
@@ -235,7 +264,7 @@ def get_photo_exif(album_id, lloc, uin, cookies):
         f"&hostUin={uin}&plat=qzone&source=qzone&topicId={album_id}&lloc={lloc}"
         f"&refer=qzone&uin={uin}&callbackFun=shine1"
     )
-    resp = requests.get(url, headers=HEADERS, cookies=cookies)
+    resp = session.get(url, cookies=cookies)
     if resp.status_code != 200:
         return {}
     try:
@@ -245,6 +274,29 @@ def get_photo_exif(album_id, lloc, uin, cookies):
     except Exception as e:
         logging.error(f"  - 获取/解析原始 EXIF 失败: {e}")
     return {}
+
+def download_image_with_retry(img_url, max_retries=3, retry_delay=1):
+    """
+    使用全局 session 下载图片，支持重试
+    返回图片二进制数据，失败返回 None
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = session.get(img_url, timeout=30)
+            if resp.status_code == 200:
+                return resp.content
+            elif resp.status_code == 404:
+                logging.warning(f"图片未找到，状态码 404，URL: {img_url}")
+                return None
+            else:
+                logging.warning(f"下载失败 (尝试 {attempt}/{max_retries})，状态码 {resp.status_code}，URL: {img_url}")
+        except Exception as e:
+            logging.error(f"下载异常 (尝试 {attempt}/{max_retries}): {e}")
+        if attempt < max_retries:
+            time.sleep(retry_delay)
+            retry_delay *= 2   # 指数退避
+    logging.error(f"下载图片最终失败: {img_url}")
+    return None
 
 # --- 更新后的下载与保存逻辑 ---
 def download_and_save(photo, album_name, folder_path, uin, cookies):
@@ -273,6 +325,9 @@ def download_and_save(photo, album_name, folder_path, uin, cookies):
     owner_name = photo.get('ownerName', photo.get('ownername', ''))    # 照片所有者名称
     modifytime = photo.get('modifytime', '')
 
+    if shutdown_event.is_set():
+        logging.warning(f"检测到停止信号，跳过图片: {topic_name}/{photo_name}")
+        return
     # 1. 获取评论
     comments = []
     if album_id and lloc:
@@ -298,32 +353,10 @@ def download_and_save(photo, album_name, folder_path, uin, cookies):
         # 退回使用上传时间，并将 '-' 转换为 ':'
         final_time_str = upload_time.replace('-', ':') if upload_time else ""
 
-    max_retries = 3
-    retry_delay = 1   # 初始延迟秒数
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = requests.get(img_url, headers=HEADERS, cookies=cookies, timeout=30)
-            if resp.status_code == 200:
-                img_data = resp.content
-                break   # 成功，跳出循环
-            elif resp.status_code == 404:
-                logging.warning(f"图片未找到，状态码 404，URL: {img_url}")
-                return  # 404 不重试，直接返回
-            else:
-                logging.warning(f"下载失败 (尝试 {attempt}/{max_retries})，状态码 {resp.status_code}，URL: {img_url}")
-        except Exception as e:
-            logging.error(f"下载异常 (尝试 {attempt}/{max_retries}): {e}")
-
-        # 如果还有重试机会，等待后继续
-        if attempt < max_retries:
-            time.sleep(retry_delay)
-            retry_delay *= 2   # 指数退避
-        else:
-            # 所有重试都失败，记录错误并返回
-            logging.error(f"下载图片最终失败: {img_url}")
-            return
-
+    # 下载图片数据（使用新的重试函数）
+    img_data = download_image_with_retry(img_url)
+    if img_data is None:
+        return
 
     os.makedirs(folder_path, exist_ok=True)
 
@@ -335,103 +368,135 @@ def download_and_save(photo, album_name, folder_path, uin, cookies):
     file_name = f"{safe_time_str}_{safe_name_str}_{modifytime}.jpg"
     file_path = os.path.join(folder_path, file_name)
 
-    try:
-        img = Image.open(BytesIO(img_data))
-        if img.mode in ('RGBA', 'LA', 'P'):
-            rgb_img = Image.new('RGB', img.size, (255, 255, 255))
-            rgb_img.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
-            img = rgb_img
-        elif img.mode != 'RGB':
-            img = img.convert('RGB')
-
+    # ---------- 处理图片截断错误 ----------
+    def try_save_image(data, use_truncated=False):
+        """尝试加载并保存图片，use_truncated 表示是否允许截断加载"""
+        old_flag = ImageFile.LOAD_TRUNCATED_IMAGES
         try:
-            if "exif" in img.info:
-                exif_dict = piexif.load(img.info["exif"])
-            else:
+            if use_truncated:
+                ImageFile.LOAD_TRUNCATED_IMAGES = True
+            img = Image.open(BytesIO(data))
+            if img.mode in ('RGBA', 'LA', 'P'):
+                rgb_img = Image.new('RGB', img.size, (255, 255, 255))
+                rgb_img.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                img = rgb_img
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+
+            # 加载或创建 EXIF 字典
+            try:
+                if "exif" in img.info:
+                    exif_dict = piexif.load(img.info["exif"])
+                else:
+                    exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+            except Exception:
                 exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
-        except Exception:
-            exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
 
-        # --- 写入获取到的原始设备和拍摄参数 EXIF ---
-        # 相机制造商和型号
-        make = origin_exif_data.get('make')
-        if make: exif_dict["0th"][piexif.ImageIFD.Make] = str(make).encode('ascii', errors='ignore')
-        
-        model = origin_exif_data.get('model')
-        if model: exif_dict["0th"][piexif.ImageIFD.Model] = str(model).encode('ascii', errors='ignore')
+            # --- 写入获取到的原始设备和拍摄参数 EXIF ---
+            # 相机制造商和型号
+            make = origin_exif_data.get('make')
+            if make:
+                exif_dict["0th"][piexif.ImageIFD.Make] = str(make).encode('ascii', errors='ignore')
+            model = origin_exif_data.get('model')
+            if model:
+                exif_dict["0th"][piexif.ImageIFD.Model] = str(model).encode('ascii', errors='ignore')
+            # 曝光、光圈、焦距、曝光补偿 (Rational类型)
+            exp_time = parse_rational(origin_exif_data.get('exposureTime'))
+            if exp_time:
+                exif_dict["Exif"][piexif.ExifIFD.ExposureTime] = exp_time
+            fnum = parse_rational(origin_exif_data.get('fnumber'))
+            if fnum:
+                exif_dict["Exif"][piexif.ExifIFD.FNumber] = fnum
+            focal = parse_rational(origin_exif_data.get('focalLength'))
+            if focal:
+                exif_dict["Exif"][piexif.ExifIFD.FocalLength] = focal
+            exp_comp = parse_rational(origin_exif_data.get('exposureCompensation'))
+            if exp_comp:
+                exif_dict["Exif"][piexif.ExifIFD.ExposureBiasValue] = exp_comp
+            # ISO、闪光灯、测光、曝光程序 (Integer类型)
+            iso = origin_exif_data.get('iso')
+            if iso and str(iso).isdigit():
+                exif_dict["Exif"][piexif.ExifIFD.ISOSpeedRatings] = int(iso)
+            flash = origin_exif_data.get('flash')
+            if flash and str(flash).isdigit():
+                exif_dict["Exif"][piexif.ExifIFD.Flash] = int(flash)
+            metering = origin_exif_data.get('meteringMode')
+            if metering and str(metering).isdigit():
+                exif_dict["Exif"][piexif.ExifIFD.MeteringMode] = int(metering)
+            exp_prog = origin_exif_data.get('exposureProgram')
+            if exp_prog and str(exp_prog).isdigit():
+                exif_dict["Exif"][piexif.ExifIFD.ExposureProgram] = int(exp_prog)
+            # 拍摄者
+            if owner_name:
+                exif_dict["0th"][piexif.ImageIFD.Artist] = str(owner_name).encode('utf-8', errors='ignore')
 
-        # 曝光、光圈、焦距、曝光补偿 (Rational类型)
-        exp_time = parse_rational(origin_exif_data.get('exposureTime'))
-        if exp_time: exif_dict["Exif"][piexif.ExifIFD.ExposureTime] = exp_time
-        
-        fnum = parse_rational(origin_exif_data.get('fnumber'))
-        if fnum: exif_dict["Exif"][piexif.ExifIFD.FNumber] = fnum
-        
-        focal = parse_rational(origin_exif_data.get('focalLength'))
-        if focal: exif_dict["Exif"][piexif.ExifIFD.FocalLength] = focal
-        
-        exp_comp = parse_rational(origin_exif_data.get('exposureCompensation'))
-        if exp_comp: exif_dict["Exif"][piexif.ExifIFD.ExposureBiasValue] = exp_comp
+            # 写入确定的拍摄/上传时间
+            if final_time_str:
+                dt_str = final_time_str.encode('ascii')
+                if piexif.ImageIFD.DateTime not in exif_dict["0th"]:
+                    exif_dict["0th"][piexif.ImageIFD.DateTime] = dt_str
+                if piexif.ExifIFD.DateTimeOriginal not in exif_dict["Exif"]:
+                    exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = dt_str
+                if piexif.ExifIFD.DateTimeDigitized not in exif_dict["Exif"]:
+                    exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = dt_str
 
-        # ISO、闪光灯、测光、曝光程序 (Integer类型)
-        iso = origin_exif_data.get('iso')
-        if iso and str(iso).isdigit(): exif_dict["Exif"][piexif.ExifIFD.ISOSpeedRatings] = int(iso)
-        
-        flash = origin_exif_data.get('flash')
-        if flash and str(flash).isdigit(): exif_dict["Exif"][piexif.ExifIFD.Flash] = int(flash)
-        
-        metering = origin_exif_data.get('meteringMode')
-        if metering and str(metering).isdigit(): exif_dict["Exif"][piexif.ExifIFD.MeteringMode] = int(metering)
-        
-        exp_prog = origin_exif_data.get('exposureProgram')
-        if exp_prog and str(exp_prog).isdigit(): exif_dict["Exif"][piexif.ExifIFD.ExposureProgram] = int(exp_prog)
+            # 写入标题、主题、备注
+            if photo_name:
+                exif_dict["0th"][piexif.ImageIFD.XPTitle] = photo_name.encode('utf-16le')
+            if album_name:
+                exif_dict["0th"][piexif.ImageIFD.XPSubject] = album_name.encode('utf-16le')
 
-        # 作者
-        if owner_name: exif_dict["0th"][piexif.ImageIFD.Artist] = str(owner_name).encode('utf-8', errors='ignore')
-
-        # 写入确定的拍摄/上传时间
-        if final_time_str:
-            dt_str = final_time_str.encode('ascii')
-            if (piexif.ImageIFD.DateTime not in exif_dict["0th"]):
-                exif_dict["0th"][piexif.ImageIFD.DateTime] = dt_str
-            if (piexif.ExifIFD.DateTimeOriginal not in exif_dict["Exif"]):
-                exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = dt_str
-            if (piexif.ExifIFD.DateTimeDigitized not in exif_dict["Exif"]):
-                exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = dt_str
-
-        # 写入标题、主题、备注
-        if photo_name:
-            exif_dict["0th"][piexif.ImageIFD.XPTitle] = photo_name.encode('utf-16le')
-        if album_name:
-            exif_dict["0th"][piexif.ImageIFD.XPSubject] = album_name.encode('utf-16le')
-
-        full_comment = ""
-        if desc: full_comment += f"{desc}\r\n"
-        if comment_text: full_comment += f"【评论】\r\n{comment_text}"
-        if full_comment.strip():
-            exif_dict["0th"][piexif.ImageIFD.XPComment] = full_comment.strip().encode('utf-16le')
-            # exif_dict["0th"][piexif.ImageIFD.ImageDescription] = full_comment.strip().encode('utf-8')
-            exif_dict["Exif"][piexif.ExifIFD.UserComment] = desc.strip().encode('utf-8')
-        # if desc:
-        #     desc = str(desc)
-        #     exif_dict["0th"][piexif.ImageIFD.ImageDescription] = desc.strip().encode('utf-8')
-        # if comment_text: 
-        #     exif_dict["0th"][piexif.ImageIFD.XPComment] = comment_text.strip().encode('utf-16le')
-
-        try:
+            full_comment = ""
+            if desc:
+                full_comment += f"{desc}\r\n"
+            if comment_text:
+                full_comment += f"【评论】\r\n{comment_text}"
+            if full_comment.strip():
+                exif_dict["0th"][piexif.ImageIFD.XPComment] = full_comment.strip().encode('utf-16le')
+                exif_dict["Exif"][piexif.ExifIFD.UserComment] = desc.strip().encode('utf-8')
+            # 保存图片
             exif_bytes = piexif.dump(exif_dict)
             img.save(file_path, 'JPEG', exif=exif_bytes)
-            logging.info(f"  已保存 (含完整EXIF): {file_path}")
+            return True
         except Exception as e:
-            logging.error(f" {photo_name} ({modifytime}) - EXIF 编码失败: {e}，将保存无 EXIF 版本")
-            img.save(file_path, 'JPEG')
+            if "truncated" in str(e).lower():
+                logging.warning(f"图片截断错误: {e}")
+            else:
+                logging.error(f"处理图片失败: {e}")
+            return False
+        finally:
+            if use_truncated:
+                ImageFile.LOAD_TRUNCATED_IMAGES = old_flag
 
-    except Exception as e:
-        logging.error(f" {photo_name} ({modifytime}) - 处理图片失败: {e}，保存原始数据")
-        with open(file_path, 'wb') as f:
-            f.write(img_data)
+    # 第一次尝试正常保存
+    if try_save_image(img_data, use_truncated=False):
+        logging.info(f"  已保存: {file_path}")
+    else:
+        # 重试下载（最多2次）
+        saved = False
+        for retry in range(2):
+            if shutdown_event.is_set():
+                logging.warning(f"检测到停止信号，跳过图片: {topic_name}/{photo_name}")
+                return
+            logging.warning(f" {photo_name} ({modifytime}) 图片加载失败，尝试重新下载 (第{retry+1}次)")
+            new_data = download_image_with_retry(img_url, max_retries=1)
+            if new_data and try_save_image(new_data, use_truncated=False):
+                img_data = new_data
+                logging.info(f"  重试成功，已保存: {file_path}")
+                saved = True
+                break
+        if not saved:
+            # 启用截断模式
+            logging.warning(f"  仍失败，启用截断模式保存")
+            if try_save_image(img_data, use_truncated=True):
+                logging.info(f"  截断模式保存成功: {file_path}")
+            else:
+                # 最后手段：保存原始二进制
+                logging.error(f"   {photo_name} ({modifytime}) 所有方式均失败，保存原始数据")
+                with open(file_path, 'wb') as f:
+                    f.write(img_data)
 
-    # 最后修改操作系统底层的文件时间
+    # 修改文件系统时间
     if final_time_str:
         try:
             # final_time_str 的格式是 "YYYY:MM:DD HH:MM:SS"
@@ -439,12 +504,39 @@ def download_and_save(photo, album_name, folder_path, uin, cookies):
             timestamp = time.mktime(time_array)
             os.utime(file_path, (timestamp, timestamp))
         except Exception as e:
-            logging.error(f" {photo_name} ({modifytime}) - 修改文件系统时间失败: {e}")
+            logging.error(f" {photo_name} ({modifytime}) 修改文件系统时间失败: {e}")
 
+def get_photos_id():
+    '''获取相册ID和相册名称'''
+    try:
+        cookies = get_cookies_dict()
+        init_session(cookies)
+    except ValueError as e:
+        logging.error(e)
+        return
+
+    logging.info("正在获取所有相册...")
+    albums = get_all_albums(target_qq, cookies)
+    logging.info(f"共找到 {len(albums)} 个相册")
+    photos_id = {}
+    for album in albums:
+        album_id = album.get('id')
+        album_name = album.get('name', '未命名')
+        #logging.info(f"处理相册: {album_name} (ID: {album_id})")
+        photos_id[album_id] = album_name
+    if photos_id == {}:
+        logging.warning("没有获取到相册ID和相册名称，可能是登录状态无效或接口变更")
+    else:
+        json_str = json.dumps(photos_id, indent=4, ensure_ascii=False)
+        with open('photos_list.json', 'w', encoding='utf-8') as f:
+            f.write(json_str)
+        logging.info(json_str)
+    return photos_id
 
 def main():
     try:
         cookies = get_cookies_dict()
+        init_session(cookies)
     except ValueError as e:
         logging.error(e)
         return
@@ -471,33 +563,7 @@ def main():
             time.sleep(0.1)
 
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-def get_photos_id():
-    '''获取相册ID和相册名称'''
-    try:
-        cookies = get_cookies_dict()
-    except ValueError as e:
-        logging.error(e)
-        return
-
-    logging.info("正在获取所有相册...")
-    albums = get_all_albums(target_qq, cookies)
-    logging.info(f"共找到 {len(albums)} 个相册")
-    photos_id = {}
-    for album in albums:
-        album_id = album.get('id')
-        album_name = album.get('name', '未命名')
-        #logging.info(f"处理相册: {album_name} (ID: {album_id})")
-        photos_id[album_id] = album_name
-    if photos_id == {}:
-        logging.warning("没有获取到相册ID和相册名称，可能是登录状态无效或接口变更")
-    else:
-        json_str = json.dumps(photos_id, indent=4, ensure_ascii=False)
-        with open('photos_list.json', 'w', encoding='utf-8') as f:
-            f.write(json_str)
-        logging.info(json_str)
-    return photos_id
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
 def main_th():
     '''
@@ -505,6 +571,7 @@ def main_th():
     '''
     try:
         cookies = get_cookies_dict()
+        init_session(cookies)
     except ValueError as e:
         logging.error(e)
         return
@@ -547,12 +614,27 @@ def main_th():
                 )
                 futures.append(future)
 
-            # 等待所有任务完成，并处理可能的异常
-            for future in as_completed(futures):
-                try:
-                    future.result()   # 如果任务抛出异常，这里会重新抛出
-                except Exception as e:
-                    logging.error(f"下载照片时出错: {e}")
+            # 循环等待任务完成，同时响应停止信号
+            while futures:
+                # 等待任意一个任务完成，或者每隔1秒检查一次停止标志
+                done, futures = wait(futures, timeout=1.0, return_when=FIRST_COMPLETED)
+                
+                # 检查是否需要停止
+                if shutdown_event.is_set():
+                    logging.warning("收到停止信号，正在取消剩余下载任务...")
+                    for future in futures:
+                        future.cancel()  # 取消尚未开始的任务
+                    # 等待所有正在运行的任务完成，以确保资源被正确清理
+                    wait(futures, timeout=5.0)
+                    logging.warning("所有下载任务已停止，程序退出。")
+                    return  # 直接退出函数，停止后续处理
+
+                # 处理已完成的任务，捕获其中的异常
+                for future in done:
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logging.error(f"下载照片时出错: {traceback.format_exc()}")
 
         # 从列表里删除这个相册的ID和名称
         albums.remove(album)
@@ -570,6 +652,7 @@ def main_photo_thread():
     '''
     try:
         cookies = get_cookies_dict()
+        init_session(cookies)
     except ValueError as e:
         logging.error(e)
         return
@@ -600,16 +683,32 @@ def main_photo_thread():
             futures.append(future)
 
         # 等待所有相册处理完成，并捕获异常
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                logging.error(f"{album_name} 相册处理出错: {traceback.format_exc()}")
+        while futures:
+            # 等待任意一个任务完成，或者每隔1秒检查一次停止标志
+            done, futures = wait(futures, timeout=1.0, return_when=FIRST_COMPLETED)
+            
+            # 检查是否需要停止
+            if shutdown_event.is_set():
+                logging.warning("收到停止信号，正在取消剩余下载任务...")
+                for future in futures:
+                    future.cancel()  # 取消尚未开始的任务
+                # 等待所有正在运行的任务完成，以确保资源被正确清理
+                wait(futures, timeout=5.0)
+                logging.warning("所有下载任务已停止，程序退出。")
+                return  # 直接退出函数，停止后续处理
+
+            # 处理已完成的任务，捕获其中的异常
+            for future in done:
+                try:
+                    future.result()
+                except Exception as e:
+                    logging.error(f"处理相册时出错: {traceback.format_exc()}")
 
     logging.info("所有相册处理完成")
 
 
 if __name__ == '__main__':
+
     # get_photos_id()
     # time.sleep(10)
     # main_photo_thread()

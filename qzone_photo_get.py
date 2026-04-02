@@ -215,6 +215,52 @@ def get_photos_in_album(album_id, uin, cookies):
         time.sleep(0.1)
     return photos
 
+
+def get_local_album_photo_count(folder_path):
+    """统计本地相册已下载图片数量。"""
+    if not os.path.isdir(folder_path):
+        return 0
+    valid_ext = {"jpg", "jpeg", "png", "gif", "bmp", "webp"}
+    count = 0
+    for entry in os.listdir(folder_path):
+        full = os.path.join(folder_path, entry)
+        if os.path.isfile(full):
+            ext = entry.lower().rsplit('.', 1)
+            if len(ext) == 2 and ext[1] in valid_ext:
+                count += 1
+    return count
+
+
+def clear_folder(folder_path):
+    """清空指定文件夹内所有文件和子目录。"""
+    if not os.path.isdir(folder_path):
+        return
+    for root, dirs, files in os.walk(folder_path, topdown=False):
+        for f in files:
+            try:
+                os.remove(os.path.join(root, f))
+            except Exception as e:
+                logging.warning(f"清理文件失败: {os.path.join(root, f)} {e}")
+        for d in dirs:
+            try:
+                os.rmdir(os.path.join(root, d))
+            except Exception as e:
+                logging.warning(f"清理子目录失败: {os.path.join(root, d)} {e}")
+
+
+def ensure_album_sync(folder_path, expected_count):
+    """检查本地相册数量与远程预期是否一致，不一致则清空并返回 False。"""
+    local_count = get_local_album_photo_count(folder_path)
+    if local_count == expected_count and expected_count > 0:
+        logging.info(f"本地相册已与远程一致 ({local_count}/{expected_count})，无需重下载。")
+        return True
+    if expected_count == 0 and local_count == 0:
+        # 空相册情况下直接认为一致
+        return True
+    logging.warning(f"本地相册数量不一致，本地: {local_count}, 远程: {expected_count}，将重新下载相册。")
+    clear_folder(folder_path)
+    return False
+
 # 获取某张照片的评论
 def get_photo_comments(album_id, lloc, uin, cookies):
     g_tk = get_g_tk(cookies)
@@ -399,8 +445,12 @@ def download_and_save(photo, album_name, folder_path, uin, cookies, count=(0,0))
 
     # 下载图片数据（使用新的重试函数）
     img_data = download_image_with_retry(img_url)
+    if img_data is None and _tmp_url and _tmp_url != img_url:
+        logging.warning(f"  - 主URL下载失败，尝试备用URL: {_tmp_url}")
+        img_data = download_image_with_retry(_tmp_url)
+
     if img_data is None:
-        logging.warning(f"  - {img_url}下载图片失败，跳过{_tmp_url}")
+        logging.warning(f"  - {img_url} 和 {_tmp_url} 均下载失败，跳过")
         return
 
     os.makedirs(folder_path, exist_ok=True)
@@ -652,6 +702,15 @@ def get_img_thread():
         if total == 0:
             continue
 
+        if ensure_album_sync(folder_path, total):
+            logging.info(f"  本地相册 {album_name} 已经完整，跳过下载")
+            albums.remove(album)
+            remaining_photos_id = {a.get('id'): a.get('name', '未命名') for a in albums}
+            with open('photos_list.json', 'w', encoding='utf-8') as f:
+                json.dump(remaining_photos_id, f, indent=4, ensure_ascii=False)
+            logging.info(f"  相册 {album_name} 已跳过，已更新 photos_list.json")
+            continue
+
         # 使用线程池并发下载（最多20个线程）
         with ThreadPoolExecutor(max_workers=20) as executor:
             # 提交所有下载任务
@@ -714,9 +773,19 @@ def get_photos_thread():
     def process_album(aid, aname, fpath):
         logging.info(f"处理相册: {aname} (ID: {aid})")
         photos = get_photos_in_album(aid, target_qq, cookies)
-        logging.info(f"  相册内有 {len(photos)} 张照片")
+        total = len(photos)
+        logging.info(f"  相册内有 {total} 张照片")
+
+        if total == 0:
+            logging.info(f"  相册 {aname} 为空，跳过")
+            return
+
+        if ensure_album_sync(fpath, total):
+            logging.info(f"  本地相册 {aname} 已经完整，跳过")
+            return
+
         for idx, photo in enumerate(photos, 1):
-            logging.info(f"    下载第 {idx}/{len(photos)} 张...")
+            logging.info(f"    下载第 {idx}/{total} 张...")
             download_and_save(photo, aname, fpath, target_qq, cookies)
             time.sleep(0.1)  # 同一相册内照片间隔，避免请求过快
 

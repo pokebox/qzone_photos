@@ -227,7 +227,7 @@ def replace_trailing_b(url):
 
 # --- 调用接口获取照片原始 EXIF ---
 def get_photo_exif(album_id, lloc, uin, cookies):
-    logging.info(f"获取照片原始 EXIF: {album_id} {lloc}")
+    logging.debug(f"获取照片原始 EXIF: {album_id} {lloc}")
     g_tk = get_g_tk(cookies)
     url = (
         f"https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/cgi-bin/common/cgi_get_exif_v2"
@@ -271,19 +271,21 @@ def download_and_save(photo, album_name, folder_path, uin, cookies):
     topic_name = photo.get('topicName', '')    # 相册名称
     geo_info = photo.get('shootGeo', {})        # 地理位置信息
     owner_name = photo.get('ownerName', photo.get('ownername', ''))    # 照片所有者名称
+    modifytime = photo.get('modifytime', '')
 
     # 1. 获取评论
     comments = []
     if album_id and lloc:
         comments = get_photo_comments(album_id, lloc, uin, cookies)
-        logging.info(f"{len(comments)} 条评论: {comments}")
+        if comments:
+            logging.info(f"{photo_name} ({modifytime}) 有 {len(comments)} 条评论: {comments}")
     comment_text = "".join(comments) if comments else ""
 
     # 2. 获取原始 EXIF
     origin_exif_data = {}
     if album_id and lloc:
         origin_exif_data = get_photo_exif(album_id, lloc, uin, cookies)
-    logging.warning(f"原始 EXIF: {origin_exif_data}")
+        logging.debug(f"原始 EXIF: {origin_exif_data}")
 
     # 3. 确定最终的时间 (优先使用 originalTime)
     original_time_str = origin_exif_data.get('originalTime', '').strip()
@@ -305,6 +307,9 @@ def download_and_save(photo, album_name, folder_path, uin, cookies):
             if resp.status_code == 200:
                 img_data = resp.content
                 break   # 成功，跳出循环
+            elif resp.status_code == 404:
+                logging.warning(f"图片未找到，状态码 404，URL: {img_url}")
+                return  # 404 不重试，直接返回
             else:
                 logging.warning(f"下载失败 (尝试 {attempt}/{max_retries})，状态码 {resp.status_code}，URL: {img_url}")
         except Exception as e:
@@ -327,8 +332,7 @@ def download_and_save(photo, album_name, folder_path, uin, cookies):
     safe_time_str = final_time_str.replace(':', '').replace(' ', '_') if final_time_str else '未知时间'
     safe_name_str = re.sub(r'[\\/*?:"<>|]', '_', photo_name)
     # safe_lloc_str = re.sub(r'[\\/*?:"<>|]', '_', lloc[:6]) if lloc else str(int(time.time() * 1000))[-6:]
-    photo_id = photo.get('modifytime', '')
-    file_name = f"{safe_time_str}_{safe_name_str}_{photo_id}.jpg"
+    file_name = f"{safe_time_str}_{safe_name_str}_{modifytime}.jpg"
     file_path = os.path.join(folder_path, file_name)
 
     try:
@@ -419,11 +423,11 @@ def download_and_save(photo, album_name, folder_path, uin, cookies):
             img.save(file_path, 'JPEG', exif=exif_bytes)
             logging.info(f"  已保存 (含完整EXIF): {file_path}")
         except Exception as e:
-            logging.error(f"  - EXIF 编码失败: {e}，将保存无 EXIF 版本")
+            logging.error(f" {photo_name} ({modifytime}) - EXIF 编码失败: {e}，将保存无 EXIF 版本")
             img.save(file_path, 'JPEG')
 
     except Exception as e:
-        logging.error(f"  - 处理图片失败: {e}，保存原始数据")
+        logging.error(f" {photo_name} ({modifytime}) - 处理图片失败: {e}，保存原始数据")
         with open(file_path, 'wb') as f:
             f.write(img_data)
 
@@ -435,7 +439,7 @@ def download_and_save(photo, album_name, folder_path, uin, cookies):
             timestamp = time.mktime(time_array)
             os.utime(file_path, (timestamp, timestamp))
         except Exception as e:
-            logging.error(f"  - 修改文件系统时间失败: {e}")
+            logging.error(f" {photo_name} ({modifytime}) - 修改文件系统时间失败: {e}")
 
 
 def main():
@@ -455,7 +459,7 @@ def main():
             continue
         album_name = album.get('name', '未命名')
         folder_name = re.sub(r'[\\/*?:"<>|]', '_', album_name)
-        folder_path = os.path.join(os.getcwd(), folder_name)
+        folder_path = os.path.join(save_path, folder_name)
         logging.info(f"处理相册: {album_name} (ID: {album_id})")
 
         photos = get_photos_in_album(album_id, target_qq, cookies)
@@ -486,9 +490,15 @@ def get_photos_id():
         album_name = album.get('name', '未命名')
         #logging.info(f"处理相册: {album_name} (ID: {album_id})")
         photos_id[album_id] = album_name
-    logging.info(json.dumps(photos_id, indent=4, ensure_ascii=False))
+    if photos_id == {}:
+        logging.warning("没有获取到相册ID和相册名称，可能是登录状态无效或接口变更")
+    else:
+        json_str = json.dumps(photos_id, indent=4, ensure_ascii=False)
+        with open('photos_list.json', 'w', encoding='utf-8') as f:
+            f.write(json_str)
+        logging.info(json_str)
     return photos_id
-    
+
 def main_th():
     '''
     照片多线程
@@ -499,9 +509,18 @@ def main_th():
         logging.error(e)
         return
 
-    logging.info("正在获取所有相册...")
-    albums = get_all_albums(target_qq, cookies)
-    logging.info(f"共找到 {len(albums)} 个相册")
+    # 判断是否有photos_list.json文件，如果有则直接读取相册ID和名称，避免重复请求接口获取相册列表
+    albums = []
+    if os.path.exists('photos_list.json'):
+        photos_id = {}
+        with open('photos_list.json', 'r', encoding='utf-8') as f:
+            photos_id = json.load(f)
+        logging.info(f"从 photos_list.json 读取到 {len(photos_id)} 个相册ID和名称")
+        albums = [{'id': aid, 'name': aname} for aid, aname in photos_id.items()]
+    else:
+        logging.info("正在获取所有相册...")
+        albums = get_all_albums(target_qq, cookies)
+        logging.info(f"共找到 {len(albums)} 个相册")
 
     for album in albums:
         album_id = album.get('id')
@@ -509,7 +528,7 @@ def main_th():
             continue
         album_name = album.get('name', '未命名')
         folder_name = re.sub(r'[\\/*?:"<>|]', '_', album_name)
-        folder_path = os.path.join(os.getcwd(), folder_name)
+        folder_path = os.path.join(save_path, folder_name)
         logging.info(f"处理相册: {album_name} (ID: {album_id})")
 
         photos = get_photos_in_album(album_id, target_qq, cookies)
@@ -535,6 +554,12 @@ def main_th():
                 except Exception as e:
                     logging.error(f"下载照片时出错: {e}")
 
+        # 从列表里删除这个相册的ID和名称
+        albums.remove(album)
+        # 写回 photos_list.json 文件，记录剩余未处理的相册
+        remaining_photos_id = {a.get('id'): a.get('name', '未命名') for a in albums}
+        with open('photos_list.json', 'w', encoding='utf-8') as f:
+            json.dump(remaining_photos_id, f, indent=4, ensure_ascii=False)
         logging.info(f"  相册 {album_name} 所有照片下载完成")
         time.sleep(1)   # 相册之间稍作延迟，避免请求过快
 
@@ -570,7 +595,7 @@ def main_photo_thread():
                 continue
             album_name = album.get('name', '未命名')
             folder_name = re.sub(r'[\\/*?:"<>|]', '_', album_name)
-            folder_path = os.path.join(os.getcwd(), folder_name)
+            folder_path = os.path.join(save_path, folder_name)
             future = executor.submit(process_album, album_id, album_name, folder_path)
             futures.append(future)
 
@@ -585,7 +610,7 @@ def main_photo_thread():
 
 
 if __name__ == '__main__':
-    get_photos_id()
-    time.sleep(10)
-    main_photo_thread()
-    # main_th()
+    # get_photos_id()
+    # time.sleep(10)
+    # main_photo_thread()
+    main_th()
